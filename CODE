@@ -1,0 +1,249 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Servo.h>
+
+// Motor pins
+const int motorIN1 = D1; // GPIO5
+const int motorIN2 = D2; // GPIO4
+const int enablePin = D3; // GPIO0 (PWM)
+
+// Servo settings
+const int servoPin = D6;  // GPIO2
+const int servoMin = 84;  // Left limit
+const int servoMax = 122; // Right limit
+int servoPosition = 103;  // Center
+
+Servo myServo;  // Servo object
+
+// AP credentials
+const char* ap_ssid = "ESP8266_Controller";
+const char* ap_password = "12345678"; // Minimum 8 characters IP FOR CONNECTING - 192.168.4.1
+
+ESP8266WebServer server(80); // Web server on port 80
+int motorSpeed = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor setup
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+  digitalWrite(motorIN1, LOW);
+  digitalWrite(motorIN2, LOW);
+
+  // Servo setup
+  myServo.attach(servoPin);
+  myServo.write(servoPosition); // Initial position
+
+  // Start AP mode
+  WiFi.softAP(ap_ssid, ap_password);
+  Serial.println("Access Point Started");
+  Serial.print("SSID: ");
+  Serial.println(ap_ssid);
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Web server handlers
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", getWebPage());
+  });
+
+  server.on("/setSpeed", HTTP_GET, []() {
+    if (server.hasArg("value")) {
+      motorSpeed = server.arg("value").toInt();
+
+      // DEAD ZONE: stop motor if within -100 to 100
+      if (motorSpeed >= -100 && motorSpeed <= 100) {
+        digitalWrite(motorIN1, LOW);
+        digitalWrite(motorIN2, LOW);
+        analogWrite(enablePin, 0);
+        Serial.println("Motor in dead zone: stopped");
+      } else {
+        int speedVal = abs(motorSpeed);
+        speedVal = constrain(speedVal, 0, 244);
+
+        if (motorSpeed > 0) {
+          digitalWrite(motorIN1, HIGH);
+          digitalWrite(motorIN2, LOW);   // Forward
+        } else {
+          digitalWrite(motorIN1, LOW);
+          digitalWrite(motorIN2, HIGH);  // Reverse
+        }
+
+        analogWrite(enablePin, speedVal);
+        Serial.print("Motor Speed set to: ");
+        Serial.println(motorSpeed);
+      }
+
+      server.send(200, "text/plain", "Speed Updated");
+    } else {
+      server.send(400, "text/plain", "Missing speed value");
+    }
+  });
+
+  server.on("/setServo", HTTP_GET, []() {
+    if (server.hasArg("angle")) {
+      int angle = server.arg("angle").toInt();
+      angle = constrain(angle, servoMin, servoMax);
+      myServo.write(angle);
+      Serial.print("Servo angle set to: ");
+      Serial.println(angle);
+      server.send(200, "text/plain", "Servo Updated");
+    } else {
+      server.send(400, "text/plain", "Missing servo angle");
+    }
+  });
+
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void loop() {
+  server.handleClient();
+}
+
+// HTML + JS webpage with Gamepad support
+String getWebPage() {
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP8266 Motor & Servo Control with Gamepad</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial; text-align: center; padding-top: 30px; }
+    #speedSlider {
+      -webkit-appearance: none;
+      width: 150px;
+      height: 25px;
+      transform: rotate(-90deg);
+      margin: 40px 0 60px 0;
+    }
+    #speedSlider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 25px;
+      height: 25px;
+      background: #4CAF50;
+      cursor: pointer;
+      border-radius: 50%;
+      border: 1px solid #000;
+      margin-top: -10px;
+    }
+    #speedSlider::-moz-range-thumb {
+      width: 25px;
+      height: 25px;
+      background: #4CAF50;
+      cursor: pointer;
+      border-radius: 50%;
+      border: 1px solid #000;
+    }
+    input[type=range] {
+      width: 80%;
+    }
+  </style>
+</head>
+<body>
+  <h2>Motor Speed Control</h2>
+  <p>Speed: <span id="speedVal">0</span></p>
+  <input type="range" min="-244" max="244" value="0" id="speedSlider"
+         oninput="updateSpeed(this.value)"
+         onchange="resetSpeedToCenter()">
+
+  <h2>Servo Position Control</h2>
+  <p>Angle: <span id="servoVal">103</span></p>
+  <input type="range" min="84" max="122" value="103" id="servoSlider"
+         oninput="updateServo(this.value)"
+         onchange="resetServoToCenter()">
+
+  <h3>Gamepad Status: <span id="gamepadStatus">Not connected</span></h3>
+
+  <script>
+    let speedVal = 0;
+    let servoVal = 103;
+    let gamepadIndex = null;
+
+    function updateSpeed(val) {
+      speedVal = val;
+      document.getElementById('speedVal').innerText = val;
+      fetch(`/setSpeed?value=${val}`);
+    }
+
+    function updateServo(val) {
+      servoVal = val;
+      document.getElementById('servoVal').innerText = val;
+      fetch(`/setServo?angle=${val}`);
+    }
+
+    function resetSpeedToCenter() {
+      const slider = document.getElementById('speedSlider');
+      slider.value = 0;
+      updateSpeed(0);
+    }
+
+    function resetServoToCenter() {
+      const slider = document.getElementById('servoSlider');
+      slider.value = 103;
+      updateServo(103);
+    }
+
+    window.addEventListener("gamepadconnected", function(e) {
+      gamepadIndex = e.gamepad.index;
+      document.getElementById('gamepadStatus').innerText = "Gamepad connected: " + e.gamepad.id;
+      console.log("Gamepad connected at index %d: %s.", e.gamepad.index, e.gamepad.id);
+      requestAnimationFrame(updateGamepad);
+    });
+
+    window.addEventListener("gamepaddisconnected", function(e) {
+      if (gamepadIndex === e.gamepad.index) {
+        gamepadIndex = null;
+        document.getElementById('gamepadStatus').innerText = "Gamepad disconnected";
+      }
+      console.log("Gamepad disconnected from index %d: %s", e.gamepad.index, e.gamepad.id);
+    });
+
+    function updateGamepad() {
+      if (gamepadIndex === null) return;
+
+      const gp = navigator.getGamepads()[gamepadIndex];
+      if (!gp) {
+        requestAnimationFrame(updateGamepad);
+        return;
+      }
+
+      // Left joystick X axis controls servo
+      let x = gp.axes[0];
+      let newServoVal = Math.round(103 + x * 19); // 84-122 range
+      newServoVal = Math.min(Math.max(newServoVal, 84), 122);
+
+      if (newServoVal !== servoVal) {
+        servoVal = newServoVal;
+        document.getElementById('servoSlider').value = servoVal;
+        document.getElementById('servoVal').innerText = servoVal;
+        fetch(`/setServo?angle=${servoVal}`);
+      }
+
+      // Triggers as buttons 6 (LT) and 7 (RT) for speed
+      let lt = gp.buttons[6]?.value || 0;
+      let rt = gp.buttons[7]?.value || 0;
+
+      let newSpeedVal = Math.round((rt - lt) * 244);
+      newSpeedVal = Math.min(Math.max(newSpeedVal, -244), 244);
+
+      if (newSpeedVal !== speedVal) {
+        speedVal = newSpeedVal;
+        document.getElementById('speedSlider').value = speedVal;
+        document.getElementById('speedVal').innerText = speedVal;
+        fetch(`/setSpeed?value=${speedVal}`);
+      }
+
+      requestAnimationFrame(updateGamepad);
+    }
+  </script>
+</body>
+</html>
+  )rawliteral";
+
+  return page;
+}
